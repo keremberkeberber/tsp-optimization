@@ -1,0 +1,380 @@
+"""
+IE 304 - Project 2 : Traveling Salesman Problem
+================================================
+Two-phase heuristic:
+    Phase 1 - Farthest Insertion  (construction)
+    Phase 2 - 2.5-opt             (2-opt + Or-opt local search)
+
+Problem rules
+-------------
+* The home / depot is the origin (0, 0) and must be visited.
+* Each instance has 20 cities; there are 10 instances; distances are Euclidean.
+* No prebuilt TSP solver or TSP library is used. Only the Python standard
+  library is needed (numpy is NOT required - everything is from scratch).
+
+Reproducibility / tie-breaking
+------------------------------
+Every choice has a deterministic tie-break so the results never change:
+  * Phase 1 - which city to insert -> LOWEST city index wins.
+  * Phase 1 - which gap to insert into -> LOWEST gap position wins.
+  * Phase 2 - which move to apply -> BEST improvement; on equal improvement,
+              the move that comes FIRST in a fixed scan order wins
+              (2-opt is scanned before Or-opt; both by ascending positions).
+All of these are implemented with a strict comparison (`>` / `<`), which by
+construction keeps the first / lowest-index candidate whenever values tie.
+
+Usage
+-----
+    python tsp_solver.py [path_to_csv] [--verify]
+
+    path_to_csv : defaults to "Project2_10instances_20cities.csv"
+    --verify    : turns on an internal self-check that recomputes each tour
+                  length from scratch and asserts it matches the fast
+                  delta-gain bookkeeping (proves the move math is correct).
+"""
+
+import csv
+import math
+import time
+from collections import defaultdict
+
+# A move must improve the tour by more than EPS to be accepted. This guards
+# against accepting numerically-zero "improvements" caused by float rounding.
+EPS = 1e-9
+
+HOME_NAME = "HOME"   # label for the depot at the origin (node index 0)
+
+
+# ----------------------------------------------------------------------------
+# Data classes
+# ----------------------------------------------------------------------------
+class Node:
+    """A single location: either the depot (index 0) or a city (index 1..20).
+
+    Each node stores its coordinates *and* a list of precomputed Euclidean
+    distances to every other node. `self.dist[j]` is the distance from this
+    node to the node whose index is `j`, so look-ups during the heuristics
+    are O(1) instead of recomputing square roots over and over.
+    """
+
+    def __init__(self, index, name, x, y):
+        self.index = index          # integer id, also used for tie-breaking
+        self.name = name            # human-readable label: HOME, A, B, ...
+        self.x = float(x)
+        self.y = float(y)
+        self.dist = []              # dist[j] = distance to node j (set later)
+
+    def distance_to(self, other):
+        """Straight-line (Euclidean) distance to another Node."""
+        return math.hypot(self.x - other.x, self.y - other.y)
+
+    def __repr__(self):
+        return f"Node({self.index}:{self.name}@({self.x:g},{self.y:g}))"
+
+
+class TSPInstance:
+    """One problem instance: all of its nodes plus their distance matrix.
+
+    nodes[0] is always the home/depot at (0, 0). nodes[k] for k = 1..20 is the
+    city with city_id == k, so the node index and the city id line up.
+    """
+
+    def __init__(self, instance_id, nodes):
+        self.instance_id = instance_id
+        self.nodes = nodes
+        self.n = len(nodes)
+        self._build_distance_matrix()
+
+    def _build_distance_matrix(self):
+        """Fill every node's `dist` list with all pairwise distances."""
+        n = self.n
+        for node in self.nodes:
+            node.dist = [0.0] * n
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = self.nodes[i].distance_to(self.nodes[j])
+                self.nodes[i].dist[j] = d
+                self.nodes[j].dist[i] = d      # distances are symmetric
+
+    def D(self, i, j):
+        """O(1) distance look-up between node index i and node index j."""
+        return self.nodes[i].dist[j]
+
+    def tour_length(self, tour):
+        """Total length of a closed tour given as a list of node indices.
+
+        The tour is cyclic: after the last node we return to the first.
+        """
+        total = 0.0
+        m = len(tour)
+        for k in range(m):
+            total += self.D(tour[k], tour[(k + 1) % m])
+        return total
+
+
+# ----------------------------------------------------------------------------
+# CSV loading
+# ----------------------------------------------------------------------------
+def load_instances(csv_path):
+    """Read the CSV and return {instance_id: TSPInstance}.
+
+    The depot (0, 0) is not in the file, so we add it as node index 0 in every
+    instance. Cities are sorted by city_id so that node index == city_id.
+    """
+    rows_by_instance = defaultdict(list)
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows_by_instance[int(row["instance_id"])].append(row)
+
+    instances = {}
+    for iid in sorted(rows_by_instance):
+        nodes = [Node(0, HOME_NAME, 0.0, 0.0)]                 # depot first
+        for row in sorted(rows_by_instance[iid], key=lambda r: int(r["city_id"])):
+            nodes.append(Node(int(row["city_id"]),
+                              row["city_name"],
+                              float(row["x"]),
+                              float(row["y"])))
+        instances[iid] = TSPInstance(iid, nodes)
+    return instances
+
+
+# ----------------------------------------------------------------------------
+# Phase 1 - Farthest Insertion (construction heuristic)
+# ----------------------------------------------------------------------------
+def farthest_insertion(inst):
+    """Build a starting tour with the Farthest Insertion heuristic.
+
+    Steps
+    -----
+    1. Start the tour with HOME (node 0) and the city farthest from HOME.
+    2. Repeat until all cities are in the tour:
+         (a) SELECT the city whose distance to its NEAREST tour node is the
+             largest (the "most far out" city).
+         (b) INSERT it into the gap (edge) of the current tour that adds the
+             least extra distance.
+         (c) UPDATE every outside city's nearest-distance with the new city.
+    Ties: lowest city index (selection), lowest gap position (insertion).
+    """
+    n = inst.n
+    in_tour = [False] * n
+    in_tour[0] = True                       # HOME is always in the tour
+
+    # --- (1) seed: HOME + the city farthest from HOME -----------------------
+    first_city, best_d = -1, -1.0
+    for c in range(1, n):
+        d = inst.D(0, c)
+        if d > best_d:                      # strict '>' -> lowest index on ties
+            best_d, first_city = d, c
+    tour = [0, first_city]
+    in_tour[first_city] = True
+
+    # nearest[c] = distance from outside-city c to its closest in-tour node
+    nearest = [math.inf] * n
+    for c in range(1, n):
+        if not in_tour[c]:
+            nearest[c] = min(inst.D(c, 0), inst.D(c, first_city))
+
+    # --- (2) insert the remaining cities one at a time ----------------------
+    cities_left = (n - 1) - 1               # 20 cities total, 1 already seeded
+    for _ in range(cities_left):
+        # (a) selection: outside city with the LARGEST nearest-distance
+        sel, sel_val = -1, -1.0
+        for c in range(1, n):
+            if not in_tour[c] and nearest[c] > sel_val:   # strict -> low index
+                sel_val, sel = nearest[c], c
+
+        # (b) insertion: gap that adds the least extra distance
+        best_pos, best_inc = -1, math.inf
+        m = len(tour)
+        for p in range(m):                  # gap p is between tour[p], tour[p+1]
+            a = tour[p]
+            b = tour[(p + 1) % m]
+            inc = inst.D(a, sel) + inst.D(sel, b) - inst.D(a, b)
+            if inc < best_inc:              # strict '<' -> lowest position on ties
+                best_inc, best_pos = inc, p
+        tour.insert(best_pos + 1, sel)
+        in_tour[sel] = True
+
+        # (c) refresh nearest-distances using the city we just added
+        for c in range(1, n):
+            if not in_tour[c]:
+                d = inst.D(c, sel)
+                if d < nearest[c]:
+                    nearest[c] = d
+
+    return tour
+
+
+# ----------------------------------------------------------------------------
+# Phase 2 - 2.5-opt local search (2-opt + Or-opt)
+# ----------------------------------------------------------------------------
+def two_point_five_opt(inst, tour, verify=False):
+    """Improve a tour with 2.5-opt = 2-opt AND Or-opt, until nothing improves.
+
+    Strategy: BEST-improvement (steepest descent). Each pass scans the entire
+    2-opt neighbourhood and the entire Or-opt neighbourhood, then applies the
+    single move with the largest positive gain. Only strictly improving moves
+    (gain > EPS) are accepted. Ties are broken by the earliest move in a fixed
+    scan order, so the run is fully reproducible.
+
+    2-opt  : remove two edges and reverse the segment between them (fixes
+             crossings).
+    Or-opt : lift a chunk of 1..3 consecutive cities and reinsert it (in its
+             original orientation) into a better edge elsewhere.
+    """
+    tour = tour[:]                          # work on a copy
+    D = inst.D
+    n = len(tour)
+    cur_len = inst.tour_length(tour)        # tracked only for the optional check
+
+    while True:
+        best_gain = EPS                     # a move must beat EPS to be accepted
+        best_move = None                    # ("2opt", i, j) or ("oropt", L, s, k)
+
+        # ================= 2-opt neighbourhood =================
+        # Remove edges (tour[i], tour[i+1]) and (tour[j], tour[j+1]); reconnect
+        # by reversing tour[i+1 .. j]. New edges: (tour[i],tour[j]) and
+        # (tour[i+1], tour[j+1]). gain = old edges - new edges.
+        for i in range(n - 1):
+            a = tour[i]
+            b = tour[i + 1]
+            for j in range(i + 1, n):
+                if i == 0 and j == n - 1:
+                    continue                # this pair is adjacent (wrap) -> no-op
+                c = tour[j]
+                d = tour[(j + 1) % n]
+                gain = (D(a, b) + D(c, d)) - (D(a, c) + D(b, d))
+                if gain > best_gain:        # strict '>' keeps the earliest on ties
+                    best_gain = gain
+                    best_move = ("2opt", i, j)
+
+        # ================= Or-opt neighbourhood =================
+        # Lift the chunk tour[s .. s+L-1] (L = 1, 2, 3) and reinsert it forward.
+        for L in (1, 2, 3):
+            if n - L < 2:                   # need at least 2 nodes left to insert into
+                continue
+            for s in range(n):
+                seg_first = tour[s]
+                seg_last = tour[(s + L - 1) % n]
+                p = tour[(s - 1) % n]                       # node just before chunk
+                q = tour[(s + L) % n]                       # node just after chunk
+                # gain from pulling the chunk out and closing the p->q gap
+                remove_gain = D(p, seg_first) + D(seg_last, q) - D(p, q)
+                # remaining nodes in cyclic order; rem[0]=q ... rem[-1]=p
+                rem = [tour[(s + L + t) % n] for t in range(n - L)]
+                # try inserting into every remaining edge except the p->q gap
+                for k in range(n - L - 1):
+                    a = rem[k]
+                    b = rem[k + 1]
+                    insert_cost = D(a, seg_first) + D(seg_last, b) - D(a, b)
+                    gain = remove_gain - insert_cost
+                    if gain > best_gain:    # strict '>' keeps the earliest on ties
+                        best_gain = gain
+                        best_move = ("oropt", L, s, k)
+
+        # ================= stop or apply =================
+        if best_move is None:
+            break                           # no improving move -> local optimum
+
+        kind = best_move[0]
+        if kind == "2opt":
+            _, i, j = best_move
+            tour[i + 1:j + 1] = tour[i + 1:j + 1][::-1]     # reverse the segment
+        else:  # "oropt"
+            _, L, s, k = best_move
+            segment = [tour[(s + t) % n] for t in range(L)]
+            rem = [tour[(s + L + t) % n] for t in range(n - L)]
+            tour = rem[:k + 1] + segment + rem[k + 1:]
+
+        cur_len -= best_gain
+        if verify:
+            # self-check: fast delta bookkeeping must match a full recompute
+            assert abs(inst.tour_length(tour) - cur_len) < 1e-6, \
+                "delta-gain bookkeeping mismatch (move math is wrong!)"
+
+    return tour
+
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+def canonical_tour(tour):
+    """Rotate so HOME(0) is first and fix the direction deterministically.
+
+    This does NOT change the tour length; it only makes the PRINTED path
+    reproducible: HOME is listed first, and we always walk toward HOME's
+    lower-indexed neighbour.
+    """
+    i = tour.index(0)
+    rot = tour[i:] + tour[:i]               # put HOME at the front
+    if rot[1] > rot[-1]:                    # pick the canonical direction
+        rot = [rot[0]] + rot[1:][::-1]
+    return rot
+
+
+def solve(inst, verify=False):
+    """Run Phase 1 then Phase 2 for one instance and return a result dict."""
+    t0 = time.perf_counter()
+    init_tour = farthest_insertion(inst)              # Phase 1
+    init_len = inst.tour_length(init_tour)
+    final_tour = two_point_five_opt(inst, init_tour, verify=verify)  # Phase 2
+    final_len = inst.tour_length(final_tour)
+    elapsed = time.perf_counter() - t0
+    return {
+        "tour": canonical_tour(final_tour),
+        "init_len": init_len,
+        "final_len": final_len,
+        "time": elapsed,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Driver
+# ----------------------------------------------------------------------------
+def main(csv_path, verify=False):
+    instances = load_instances(csv_path)
+
+    print(f"Solving {len(instances)} instances "
+          f"with Farthest Insertion + 2.5-opt"
+          f"{'  [verify ON]' if verify else ''}\n")
+
+    results = {}
+    for iid in sorted(instances):
+        inst = instances[iid]
+        res = solve(inst, verify=verify)
+        results[iid] = res
+        path = " -> ".join(inst.nodes[idx].name for idx in res["tour"]) + " -> HOME"
+        print(f"Instance {iid:2d}:  final length = {res['final_len']:9.4f}"
+              f"   time = {res['time'] * 1000:7.2f} ms")
+        print(f"             tour: {path}")
+
+    # ---------------------------- summary table ----------------------------
+    print("\n" + "=" * 66)
+    print("SUMMARY ACROSS ALL INSTANCES")
+    print("=" * 66)
+    print(f"{'Inst':>4} | {'FI length':>11} | {'Final length':>12} | "
+          f"{'Improve':>8} | {'Time(ms)':>9}")
+    print("-" * 66)
+    tot_final = tot_time = 0.0
+    for iid in sorted(results):
+        r = results[iid]
+        imp = 100.0 * (r["init_len"] - r["final_len"]) / r["init_len"]
+        tot_final += r["final_len"]
+        tot_time += r["time"]
+        print(f"{iid:>4} | {r['init_len']:>11.4f} | {r['final_len']:>12.4f} | "
+              f"{imp:>7.2f}% | {r['time'] * 1000:>9.2f}")
+    print("-" * 66)
+    n = len(results)
+    print(f"{'Avg':>4} | {'':>11} | {tot_final / n:>12.4f} | "
+          f"{'':>8} | {tot_time / n * 1000:>9.2f}")
+    print(f"{'Sum':>4} | {'':>11} | {tot_final:>12.4f} | "
+          f"{'':>8} | {tot_time * 1000:>9.2f}")
+    print("=" * 66)
+
+
+if __name__ == "__main__":
+    import sys
+    args = [a for a in sys.argv[1:] if a != "--verify"]
+    csv_path = args[0] if args else "Project2_10instances_20cities.csv"
+    main(csv_path, verify=("--verify" in sys.argv))

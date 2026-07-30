@@ -1,0 +1,139 @@
+import numpy as np
+import pandas as pd
+import time  # Süre ölçümü için time modülü eklendi
+
+# 1. Veriyi Yükleme ve Yapıyı Otomatik Düzeltme
+file_name = "Project2_10instances_20cities.csv"
+
+try:
+    # Önce ayırıcıyı (sep) otomatik tespit etmek için Python motorunu kullanıyoruz
+    df = pd.read_csv(file_name, sep=None, engine='python')
+
+    # Sütun isimlerinin başındaki ve sonundaki gizli boşlukları temizleyelim
+    df.columns = df.columns.str.strip()
+
+    # Sütun isimlerini tamamen küçük harfe çevirelim (büyük-küçük harf hatasını önlemek için)
+    df.columns = df.columns.str.lower()
+
+    print("Okunan sütun başlıkları:", list(df.columns))
+
+except FileNotFoundError:
+    print(f"Hata: '{file_name}' dosyası bulunamadı. Lütfen dosyanızı CSV formatında kaydedip kodla aynı klasöre koyun.")
+    exit()
+
+# Hiperparametreler
+alpha = 1
+beta = 5
+rho = 0.5
+Q = 100
+num_ants = 15
+num_iterations = 50
+
+# Origin (Başlangıç/Depo) Noktası Koordinatları
+origin_x, origin_y = 0, 0
+
+# Otomatik küçük harfe çevirdiğimiz için 'instance_id' sütununu kontrol ediyoruz
+if 'instance_id' not in df.columns:
+    print("\n--- HATA: Sütun isimleri eşleşmiyor! ---")
+    print(f"Dosyanızda bulunan mevcut sütunlar: {list(df.columns)}")
+    print("Lütfen CSV dosyanızın ilk satırında 'instance_id', 'city_id', 'x', 'y' başlıklarının olduğundan emin olun.")
+    exit()
+
+# Dosyadaki her bir benzersiz problemi sırayla çöz
+unique_instances = df['instance_id'].unique()
+print(f"\nToplam {len(unique_instances)} farklı problem tespit edildi. Çözüm başlatılıyor...\n")
+
+for instance in unique_instances:
+    print(f"--- PROBLEM (Instance ID): {instance} Çözülüyor ---")
+
+    # --- KRONOMETREYİ BAŞLAT ---
+    start_time = time.perf_counter()
+
+    # İlgili probleme ait şehirleri filtrele
+    instance_df = df[df['instance_id'] == instance]
+
+    x_coords = instance_df['x'].values
+    y_coords = instance_df['y'].values
+
+    # 0. indekse Başlangıç (Origin) koordinatlarını ekleme
+    x = np.insert(x_coords, 0, origin_x)
+    y = np.insert(y_coords, 0, origin_y)
+
+    num_cities = len(x)
+
+    # Mesafe Matrisi Hesaplama
+    distances = np.zeros((num_cities, num_cities))
+    for i in range(num_cities):
+        for j in range(num_cities):
+            distances[i][j] = np.sqrt((x[i] - x[j]) ** 2 + (y[i] - y[j]) ** 2)
+
+    # Görünürlük (Visibility) Hesaplama
+    with np.errstate(divide='ignore'):
+        visibility = 1.0 / distances
+    np.fill_diagonal(visibility, 0)
+
+    # Feromon matrisini başlatma
+    pheromones = np.ones((num_cities, num_cities)) * 0.1
+
+    global_best_distance = float('inf')
+    global_best_tour = []
+
+    # ACO Ana Döngüsü
+    for iteration in range(num_iterations):
+        all_ant_results = []
+
+        for ant in range(num_ants):
+            visited_list = [0]
+            current_city = 0
+
+            while len(visited_list) < num_cities:
+                unvisited = [c for c in range(num_cities) if c not in visited_list]
+
+                preferences = []
+                for city in unvisited:
+                    tau = pheromones[current_city][city] ** alpha
+                    eta = visibility[current_city][city] ** beta
+                    preferences.append(tau * eta)
+
+                total_preference = sum(preferences)
+
+                if total_preference == 0:
+                    probabilities = [1.0 / len(unvisited)] * len(unvisited)
+                else:
+                    probabilities = [p / total_preference for p in preferences]
+
+                next_city = np.random.choice(unvisited, p=probabilities)
+                visited_list.append(next_city)
+                current_city = next_city
+
+            visited_list.append(0)
+
+            tour_distance = 0
+            for i in range(len(visited_list) - 1):
+                tour_distance += distances[visited_list[i]][visited_list[i + 1]]
+
+            all_ant_results.append((visited_list, tour_distance))
+
+            if tour_distance < global_best_distance:
+                global_best_distance = tour_distance
+                global_best_tour = visited_list
+
+        # Buharlaşma ve Feromon Güncelleme
+        pheromones = (1 - rho) * pheromones
+        for ant_tour, tour_distance in all_ant_results:
+            deposit_amount = Q / tour_distance
+            for i in range(len(ant_tour) - 1):
+                city_a = ant_tour[i]
+                city_b = ant_tour[i + 1]
+                pheromones[city_a][city_b] += deposit_amount
+                pheromones[city_b][city_a] += deposit_amount
+
+    # --- KRONOMETREYİ DURDUR VE SÜREYİ HESAPLA ---
+    end_time = time.perf_counter()
+    execution_time = end_time - start_time
+
+    print(f"  En Kısa Mesafe: {global_best_distance:.4f}")
+    print(f"  En İyi Rota: {global_best_tour}")
+    print(f"  Çalışma Süresi: {execution_time:.4f} saniye\n")  # Süreyi yazdır
+
+print("Tüm problemler başarıyla çözüldü!")
